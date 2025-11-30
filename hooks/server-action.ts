@@ -1,30 +1,35 @@
-import type { ActionHandler, CustomErrorTypes } from '@/lib/server-action'
-import { typedObjectEntries } from '@/lib/utils'
-import { useEffect } from 'react'
-import { type FieldValues, type UseFormSetError } from 'react-hook-form'
+import type { CustomErrorTypes, ServerAction } from '@/lib/server-action'
+import { useEffect, useState } from 'react'
 import { useCountDown } from './countdown'
 
-type Init<R, T extends FieldValues = FieldValues> = {
+type OnErrorError = { type: CustomErrorTypes | 'server_error'; message: string }
+
+type InitNoInputs<R> = {
   rateLimitKey: string
-  reactForm?: { setError: UseFormSetError<T> }
-  onSuccess?: (actionData: { data: R }) => void
-  onError?: (error: { type: CustomErrorTypes | 'server_error'; message: string }) => void
-  onSettled?: (actionData: ActionHandler<R, T>) => void
+  onSuccess?: (data: R) => void
+  onError?: (error: OnErrorError) => void
+  onSettled?: (actionData: { success: true; data: R } | { success: false; error: OnErrorError }) => void
 }
 
-type UserServerActionRateLimiter = { rateLimiter: { isLimit: false } | { isLimit: true; remainingSeconds: number } }
+type Init<R, TFields> = InitNoInputs<R> & { onFieldError?: (errorFields: { [P in keyof TFields]?: string[] }) => void }
+
+type UseServerAction = { isPending: boolean; rateLimiter: { isLimit: boolean; remainingSeconds: number } }
 
 export function useServerAction<R>(
-  serverAction: () => Promise<ActionHandler<R>>,
-  init: Init<R>,
-): UserServerActionRateLimiter & { execute: () => Promise<R | undefined> }
+  serverAction: () => Promise<ServerAction<R, never>>,
+  init: InitNoInputs<R>,
+): UseServerAction & { execute: () => Promise<R> }
 
-export function useServerAction<R, T extends FieldValues>(
-  serverAction: (fields: T) => Promise<ActionHandler<R>>,
-  init: Init<R, T> & Required<Pick<Init<R, T>, 'reactForm'>>,
-): UserServerActionRateLimiter & { execute: (fields: FieldValues) => Promise<R | undefined> }
+export function useServerAction<R, TFields>(
+  serverAction: (fields: TFields) => Promise<ServerAction<R, TFields>>,
+  init: Init<R, TFields>,
+): UseServerAction & { execute: (inputs: TFields) => Promise<R> }
 
-export function useServerAction<R>(serverAction: (fields?: FieldValues) => Promise<ActionHandler<R>>, init: Init<R>) {
+export function useServerAction<R, TFields>(
+  serverAction: (() => Promise<ServerAction<R, never>>) | ((fields: TFields) => Promise<ServerAction<R, TFields>>),
+  init: Init<R, TFields>,
+) {
+  const [isPending, setIsPending] = useState(false)
   const { timeLeft, setTimeLeft } = useCountDown()
 
   useEffect(() => {
@@ -34,30 +39,33 @@ export function useServerAction<R>(serverAction: (fields?: FieldValues) => Promi
   }, [])
 
   return {
+    isPending,
     rateLimiter: { isLimit: timeLeft > 0, remainingSeconds: timeLeft },
-    execute: async (fields?: FieldValues) => {
-      const actionData = fields ? await serverAction(fields) : await serverAction()
+    execute: async (inputs: TFields) => {
+      setIsPending(true)
+      const actionData = await serverAction(inputs)
 
-      init.onSettled?.(actionData)
+      setIsPending(false)
 
       if (actionData.ratelimit) {
-        localStorage.setItem(init.rateLimitKey, actionData.ratelimit.retryAt.toString())
-        setTimeLeft(getSecondsLeft(actionData.ratelimit.retryAt))
+        localStorage.setItem(init.rateLimitKey, actionData.ratelimit.refillAt.toString())
+        setTimeLeft(getSecondsLeft(actionData.ratelimit.refillAt))
       }
 
       if (actionData.isError) {
-        const isMessagesError = actionData.type !== 'rate_limit' && actionData.type !== 'invalid_inputs'
-        if (init.onError && isMessagesError) init.onError(actionData)
+        if (actionData.type === 'input_error') init.onFieldError?.(actionData.fieldErrors)
 
-        if (actionData.type === 'invalid_inputs' && init.reactForm) {
-          for (const [key, error] of typedObjectEntries(actionData.fieldErrors)) {
-            init.reactForm.setError(key, { message: error[0] })
-          }
+        if (actionData.type !== 'rate_limit' && actionData.type !== 'input_error') {
+          init.onError?.(actionData)
+          init.onSettled?.({ success: false, error: actionData })
         }
-      } else {
-        init.onSuccess?.(actionData)
-        return actionData.data
+        return undefined
       }
+
+      const data = actionData.data
+      init.onSuccess?.(data)
+      init.onSettled?.({ success: true, data })
+      return data
     },
   }
 }

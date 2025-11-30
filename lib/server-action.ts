@@ -1,46 +1,66 @@
 import 'server-only'
-
-import { z, ZodError, type ZodObject } from 'zod'
+import { z } from 'zod'
 import { createMemoryRateLimiter, type RateLimiterParams } from './rate-limiter'
 import { typedObjectEntries } from './utils'
 
-type RateLimit = { ratelimit: { retryAt: number } }
 type RateLimiterInit = { key: string } & RateLimiterParams
+type RateLimit = { ratelimit: { refillAt: number } }
 
-type InputError<T> = { type: 'invalid_inputs' } & z.core.$ZodFlattenedError<z.core.output<T>>
-type ServerError = { type: 'server_error'; message: string }
-type RateLimitError = { type: 'rate_limit' } & RateLimit
-type Errors<T> = { isError: true } & (RateLimitError | InputError<T> | CustomError | ServerError)
+type RateLimitError = { isError: true; type: 'rate_limit' } & RateLimit
+type ServerError = { isError: true; type: 'server_error'; message: string }
+type InputError<TFields> = TFields extends never ? never : { isError: true; type: 'input_error' } & z.core.$ZodFlattenedError<TFields>
+type Errors<TFields> = InputError<TFields> | CustomError | ServerError
 
-type Success = { isError?: undefined }
-type HandlerSuccess<R> = Success & { data: R }
+type Success<R> = { data: R; isError?: undefined }
 
-export type ActionHandler<R, T = undefined> = Partial<RateLimit> & (HandlerSuccess<R> | Errors<T>)
-function handler<T extends ZodObject>(schema?: T) {
+type ServerActionErrors<TFields> = Errors<TFields> | RateLimitError
+export type ServerAction<R, TFields> = (Success<R> | ServerActionErrors<TFields>) & Partial<RateLimit>
+
+export function createServerAction(): {
+  ratelimit: (init: RateLimiterInit) => {
+    handle: <R>(serverActionFn: () => Promise<R>) => () => Promise<ServerAction<R, never>>
+  }
+}
+
+export function createServerAction<TSchema extends z.ZodObject>(
+  schema: TSchema,
+): {
+  ratelimit: (init: RateLimiterInit) => {
+    handle: <R>(
+      serverActionFn: (fields: z.core.output<TSchema>, throwFieldError: ThrowFieldErrorFn<z.infer<TSchema>>) => Promise<R>,
+    ) => (inputs: z.infer<TSchema>) => Promise<ServerAction<R, z.core.output<TSchema>>>
+  }
+}
+
+export function createServerAction<TSchema extends z.ZodObject>(schema?: TSchema) {
+  type Fields = z.infer<TSchema>
   return {
     ratelimit: (init: RateLimiterInit) => {
       const rateLimiter = createMemoryRateLimiter(init)
 
       return {
-        handle: <R>(action: (fields?: z.infer<T>) => Promise<R>) => {
-          return async (userInputs?: z.infer<T>): Promise<ActionHandler<R, T>> => {
-            const limiter = rateLimiter(init.key)
-            if (limiter.isExceed) return { isError: true, type: 'rate_limit', ratelimit: { retryAt: limiter.refillAt } }
+        handle: <R>(serverActionFn: (fields?: Fields, throwFieldError?: ThrowFieldErrorFn<Fields>) => Promise<R>) => {
+          return async (inputs?: unknown): Promise<ServerAction<R, Fields>> => {
+            const limiterId = init.key // todo: + ip address here
+            const limiter = rateLimiter(limiterId)
+            if (limiter.isExceed) return { isError: true, type: 'rate_limit', ratelimit: { refillAt: limiter.retryAt } }
 
-            const newLimiter = limiter.decrement()
-            const data = await actionFn()
-            return { ...data, ratelimit: newLimiter.shouldWarn ? { retryAt: newLimiter.refillAt } : undefined }
+            const actionData = await _action()
+            const ratelimit = limiter.shouldWarn ? { refillAt: limiter.refillAt } : undefined
+            return { ...actionData, ratelimit }
 
-            async function actionFn(): Promise<HandlerSuccess<R> | Exclude<Errors<T>, RateLimitError>> {
+            async function _action(): Promise<Success<R> | Errors<Fields>> {
               try {
-                const fields = schema ? schema.parse(userInputs) : undefined
-                const data = await action(fields)
-                return { data }
+                const parsedInputs = schema?.parse(inputs)
+                const actionData = schema ? await serverActionFn(parsedInputs, throwFieldZodError) : await serverActionFn()
+                return { data: actionData }
               } catch (err) {
-                if (err instanceof CustomError) return { isError: true, ...err }
-                if (err instanceof ZodError) return { isError: true, type: 'invalid_inputs', ...z.flattenError(err) }
-                return { isError: true, type: 'server_error', message: 'Something went wrong' }
+                if (err instanceof z.ZodError && schema)
+                  return { isError: true, type: 'input_error', ...z.flattenError(err) } as InputError<Fields>
+                if (err instanceof CustomError) return { ...err }
+                return { isError: true, type: 'server_error', message: 'Something went wrong!' }
               }
+              //
             }
           }
         },
@@ -49,33 +69,14 @@ function handler<T extends ZodObject>(schema?: T) {
   }
 }
 
-export function createServerAction(): {
-  ratelimit: (init: RateLimiterInit) => {
-    handle: <R>(action: () => Promise<R>) => () => Promise<Exclude<ActionHandler<R>, InputError<undefined>>>
-  }
-}
-
-// prettier-ignore
-export function createServerAction<T extends ZodObject>(schema: T): {
-  ratelimit: (init: RateLimiterInit) => {
-    handle: <R>(action: (fields: z.infer<T>) => Promise<R>) => (userInputs: z.infer<T>) => Promise<ActionHandler<R, T>>
-  }
-}
-
-export function createServerAction(schema?: ZodObject) {
-  return handler(schema)
-}
-
-export function throwFieldError<T>(fields: Partial<Record<keyof T, string>>[]): never {
-  const errors = fields.flatMap((err) =>
-    typedObjectEntries(err).map(([key, value]) => ({ code: 'custom' as const, path: [key], message: value })),
-  )
-  throw new ZodError(errors)
+type ThrowFieldErrorFn<TFields> = (fields: Partial<Record<keyof TFields, string>>) => never
+function throwFieldZodError(fields: Partial<Record<string, string>>): never {
+  throw new z.ZodError(typedObjectEntries(fields).map(([key, value]) => ({ code: 'custom' as const, path: [key], message: value })))
 }
 
 export type CustomErrorTypes = 'not_found' | 'expired' | 'unauthorized' | 'forbidden'
-
 export class CustomError {
+  isError = true as const
   type: CustomErrorTypes
   message: string
 

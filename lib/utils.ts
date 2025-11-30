@@ -5,9 +5,9 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
-export function generateSecureRandomString(): string {
+export function generateSecureRandomString(length: 24 | 28 = 24): string {
   const alphabet = 'abcdefghijkmnpqrstuvwxyz23456789'
-  const bytes = new Uint8Array(24)
+  const bytes = new Uint8Array(length)
   crypto.getRandomValues(bytes)
 
   let id = ''
